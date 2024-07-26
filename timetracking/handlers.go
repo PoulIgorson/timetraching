@@ -47,54 +47,20 @@ func (h *TimeTrackingService) SetupHandlers(group fiber.Router) {
 // @Failure 500 {string} error "Внутренняя ошибка сервера"
 // @Router /info [get]
 func (h *TimeTrackingService) HandlerGetUser(w http.ResponseWriter, r *http.Request) {
-	slog.Info("TimeTrackingService: HandlerGetUser")
+	const op = "TimeTrackingService: HandlerGetUser"
+
+	slog.Info(op)
 
 	pasportSeries := r.URL.Query().Get("pasportSeries")
 	pasportNumber := r.URL.Query().Get("pasportNumber")
 
-	slog.Debug("TimeTrackingService: HandlerGetUser", slog.String("pasportSeries", pasportSeries), slog.String("pasportNumber", pasportNumber))
-
-	if pasportSeries == "" || pasportNumber == "" {
-		slog.Info("TimeTrackingService: HandlerGetUser failed", slog.String("error", "invalid pasport number"))
-		http.Error(w, "invalid pasport number", http.StatusBadRequest)
-		return
-	}
-
-	filter := map[string]any{
-		"pasport_series": pasportSeries,
-		"pasport_number": pasportNumber,
-	}
-
-	user, err := h.FindUsersByFilter(filter, 1, 0)
+	user, err := h.FindUserByPassport(pasportSeries, pasportNumber)
 	if err != nil {
-		slog.Info("TimeTrackingService: HandlerGetUser failed", slog.String("error", err.Error()))
-
-		if errors.As(err, &ErrInternal) {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
+		sendResponseOrError(op, err, w, nil)
 	}
 
-	if len(user) == 0 {
-		slog.Debug("TimeTrackingService: HandlerGetUser failed", slog.String("error", "user not found"))
-		http.Error(w, "user not found", http.StatusBadRequest)
-		return
-	}
-
-	slog.Debug("TimeTrackingService: HandlerGetUser success", slog.Any("user", user))
-
-	body, err := json.Marshal(user[0])
-	if err != nil {
-		slog.Info("TimeTrackingService: HandlerGetUser failed", slog.String("error", err.Error()))
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	w.Write(body)
-	w.WriteHeader(http.StatusOK)
+	body, err := json.Marshal(user)
+	sendResponseOrError("HandlerGetUser", err, w, body, slog.Any("user", user))
 }
 
 // HandlerGetUsers - получение данных пользователей по фильтру и пагинации
@@ -117,17 +83,7 @@ func (h *TimeTrackingService) HandlerGetUsers(w http.ResponseWriter, r *http.Req
 	limitS := r.URL.Query().Get("limit")
 	offsetS := r.URL.Query().Get("offset")
 
-	filter := map[string]any{}
-	if len(filterS) != 0 {
-		pairs := strings.Split(filterS, "%26%26")
-		for _, pair := range pairs {
-			parts := strings.Split(pair, "=")
-			if len(parts) != 2 {
-				continue
-			}
-			filter[parts[0]] = parts[1]
-		}
-	}
+	filter := parseFilter(filterS)
 
 	limit, _ := strconv.Atoi(limitS)
 	offset, _ := strconv.Atoi(offsetS)
@@ -136,38 +92,14 @@ func (h *TimeTrackingService) HandlerGetUsers(w http.ResponseWriter, r *http.Req
 
 	users, err := h.FindUsersByFilter(filter, limit, offset)
 	if err != nil {
-		slog.Info("TimeTrackingService: HandlerGetUsers failed", slog.String("error", err.Error()))
-
-		if errors.As(err, &ErrInternal) {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		sendResponseOrError("HandlerGetUsers", err, w, nil)
 		return
 	}
 
-	if len(users) == 0 {
-		slog.Info("TimeTrackingService: HandlerGetUsers failed", slog.String("error", "users not found"))
-		http.Error(w, "users not found", http.StatusBadRequest)
-		return
-	}
-
-	resp := map[string]any{
+	body, err := json.Marshal(map[string]any{
 		"users": users,
-	}
-
-	body, err := json.Marshal(resp)
-	if err != nil {
-		slog.Info("TimeTrackingService: HandlerGetUsers failed", slog.String("error", err.Error()))
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	slog.Debug("TimeTrackingService: HandlerGetUsers success")
-
-	w.Write(body)
-	w.WriteHeader(http.StatusOK)
+	})
+	sendResponseOrError("HandlerGetUsers", err, w, body, slog.String("users", fmt.Sprintf("%+t", users)))
 }
 
 // @Summary Затраты времени на задачи
@@ -198,39 +130,31 @@ func (h *TimeTrackingService) HandlerCalculateCostByUser(w http.ResponseWriter, 
 		periodToS = periodToS + " 23:59:59"
 	}
 
-	periodFrom, _ := time.Parse(time.DateTime, periodFromS)
-	periodTo, _ := time.Parse(time.DateTime, periodToS)
+	periodFrom, errFrom := time.Parse(time.DateTime, periodFromS)
+	periodTo, errTo := time.Parse(time.DateTime, periodToS)
+
+	if len(pasportSeries) == 0 || len(pasportNumber) == 0 {
+		sendResponseOrError("HandlerCalculateCostByUser", &InvalidError{"invalid passport"}, w, nil)
+		return
+	}
+
+	if errFrom != nil || errTo != nil {
+		sendResponseOrError("HandlerCalculateCostByUser", errors.Join(&InvalidError{"invalid period"}, errFrom, errTo), w, nil)
+		return
+	}
 
 	slog.Debug("TimeTrackingService: HandlerCalculateCostByUser", slog.String("pasportSeries", pasportSeries), slog.String("pasportNumber", pasportNumber), slog.Any("periodFrom", periodFrom), slog.Any("periodTo", periodTo))
 
 	cost, err := h.CalculateCostByUser(pasportSeries, pasportNumber, periodFrom, periodTo)
 	if err != nil {
-		slog.Info("TimeTrackingService: HandlerCalculateCostByUser failed", slog.String("error", err.Error()))
-
-		if errors.As(err, &ErrInternal) {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		sendResponseOrError("HandlerCalculateCostByUser", err, w, nil)
 		return
 	}
 
-	resp := map[string]any{
+	body, err := json.Marshal(map[string]any{
 		"costs": cost,
-	}
-
-	body, err := json.Marshal(resp)
-	if err != nil {
-		slog.Info("TimeTrackingService: HandlerCalculateCostByUser failed", slog.String("error", err.Error()))
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	slog.Debug("TimeTrackingService: HandlerCalculateCostByUser success")
-
-	w.Write(body)
-	w.WriteHeader(http.StatusOK)
+	})
+	sendResponseOrError("HandlerCalculateCostByUser", err, w, body, slog.Any("costs", cost))
 }
 
 // HandlerBeginTaskForUser - начать отсчет времени по задаче
@@ -249,24 +173,19 @@ func (h *TimeTrackingService) HandlerBeginTaskForUser(w http.ResponseWriter, r *
 	slog.Info("TimeTrackingService: HandlerBeginTaskForUser")
 
 	body, err := io.ReadAll(r.Body)
-
-	slog.Debug("TimeTrackingService: HandlerBeginTaskForUser", slog.String("body", string(body)))
-
 	if err != nil {
-		slog.Info("TimeTrackingService: HandlerBeginTaskForUser failed", slog.String("error", err.Error()))
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		sendResponseOrError("HandlerBeginTaskForUser", err, w, nil)
 		return
 	}
+
+	slog.Debug("TimeTrackingService: HandlerBeginTaskForUser", slog.String("body", string(body)))
 
 	var data struct {
 		PasportSeriesNumber string `json:"pasportNumber"`
 		TaskId              int32  `json:"taskId"`
 	}
-
-	err = json.Unmarshal(body, &data)
-	if err != nil {
-		slog.Info("TimeTrackingService: HandlerBeginTaskForUser failed", slog.String("error", err.Error()))
-		http.Error(w, err.Error(), http.StatusBadRequest)
+	if err := json.Unmarshal(body, &data); err != nil {
+		sendResponseOrError("HandlerBeginTaskForUser", err, w, body)
 		return
 	}
 
@@ -274,28 +193,12 @@ func (h *TimeTrackingService) HandlerBeginTaskForUser(w http.ResponseWriter, r *
 
 	seriesNumber := strings.Split(data.PasportSeriesNumber, " ")
 	if len(seriesNumber) != 2 || seriesNumber[0] == "" || seriesNumber[1] == "" {
-		slog.Info("TimeTrackingService: HandlerBeginTaskForUser failed", slog.String("error", "invalid pasport number"))
-		http.Error(w, "invalid pasport number", http.StatusBadRequest)
+		sendResponseOrError("HandlerBeginTaskForUser", &InvalidError{"invalid passport"}, w, body)
 		return
 	}
 
 	err = h.BeginTaskForUser(seriesNumber[0], seriesNumber[1], data.TaskId)
-	if err != nil {
-		slog.Info("TimeTrackingService: HandlerBeginTaskForUser failed", slog.String("error", err.Error()))
-
-		if errors.As(err, &ErrInternal) {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-
-	slog.Debug("TimeTrackingService: HandlerBeginTaskForUser success")
-
-	w.Write([]byte("OK"))
-	w.WriteHeader(http.StatusOK)
+	sendResponseOrError("HandlerBeginTaskForUser", err, w, nil)
 }
 
 // HandlerEndTaskForUser - закончить отсчет времени по задаче
@@ -309,15 +212,14 @@ func (h *TimeTrackingService) HandlerBeginTaskForUser(w http.ResponseWriter, r *
 // @Failure 500 {string} error "Внутренняя ошибка сервера"
 // @Router /end-task-for-user [post]
 func (h *TimeTrackingService) HandlerEndTaskForUser(w http.ResponseWriter, r *http.Request) {
-	slog.Info("TimeTrackingService: HandlerEndTaskForUser")
+	const op = "TimeTrackingService: HandlerEndTaskForUser"
+
+	slog.Info(op)
 
 	body, err := io.ReadAll(r.Body)
-
-	slog.Debug("TimeTrackingService: HandlerEndTaskForUser", slog.String("body", string(body)))
-
+	slog.Debug(op, slog.String("body", string(body)))
 	if err != nil {
-		slog.Info("TimeTrackingService: HandlerEndTaskForUser failed", slog.String("error", err.Error()))
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		sendResponseOrError(op, err, w, nil)
 		return
 	}
 
@@ -325,11 +227,8 @@ func (h *TimeTrackingService) HandlerEndTaskForUser(w http.ResponseWriter, r *ht
 		PasportSeriesNumber string `json:"pasportNumber"`
 		TaskId              int32  `json:"taskId"`
 	}
-
-	err = json.Unmarshal(body, &data)
-	if err != nil {
-		slog.Info("TimeTrackingService: HandlerEndTaskForUser failed", slog.String("error", err.Error()))
-		http.Error(w, err.Error(), http.StatusBadRequest)
+	if err := json.Unmarshal(body, &data); err != nil {
+		sendResponseOrError(op, err, w, nil)
 		return
 	}
 
@@ -337,28 +236,12 @@ func (h *TimeTrackingService) HandlerEndTaskForUser(w http.ResponseWriter, r *ht
 
 	seriesNumber := strings.Split(data.PasportSeriesNumber, " ")
 	if len(seriesNumber) != 2 || seriesNumber[0] == "" || seriesNumber[1] == "" {
-		slog.Info("TimeTrackingService: HandlerEndTaskForUser failed", slog.String("error", "invalid pasport number"))
-		http.Error(w, "invalid pasport number", http.StatusBadRequest)
+		sendResponseOrError(op, &InvalidError{"invalid passport"}, w, body)
 		return
 	}
 
 	err = h.EndTaskForUser(seriesNumber[0], seriesNumber[1], data.TaskId)
-	if err != nil {
-		slog.Info("TimeTrackingService: HandlerEndTaskForUser failed", slog.String("error", err.Error()))
-
-		if errors.As(err, &ErrInternal) {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-
-	slog.Debug("TimeTrackingService: HandlerEndTaskForUser success")
-
-	w.Write([]byte("OK"))
-	w.WriteHeader(http.StatusOK)
+	sendResponseOrError(op, err, w, nil)
 }
 
 // HandlerDeleteUser - удалить пользователя
@@ -374,26 +257,24 @@ func (h *TimeTrackingService) HandlerEndTaskForUser(w http.ResponseWriter, r *ht
 // @Failure 500 {string} error "Внутренняя ошибка сервера"
 // @Router /users [delete]
 func (h *TimeTrackingService) HandlerDeleteUser(w http.ResponseWriter, r *http.Request) {
-	slog.Info("TimeTrackingService: HandlerDeleteUser")
+	const op = "TimeTrackingService: HandlerDeleteUser"
+
+	slog.Info(op)
 
 	body, err := io.ReadAll(r.Body)
 
-	slog.Debug("TimeTrackingService: HandlerDeleteUser", slog.String("body", string(body)))
+	slog.Debug(op, slog.String("body", string(body)))
 
 	if err != nil {
-		slog.Info("TimeTrackingService: HandlerDeleteUser failed", slog.String("error", err.Error()))
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		sendResponseOrError(op, err, w, nil)
 		return
 	}
 
 	var data struct {
 		PasportSeriesNumber string `json:"pasportNumber"`
 	}
-
-	err = json.Unmarshal(body, &data)
-	if err != nil {
-		slog.Info("TimeTrackingService: HandlerDeleteUser failed", slog.String("error", err.Error()))
-		http.Error(w, err.Error(), http.StatusBadRequest)
+	if err := json.Unmarshal(body, &data); err != nil {
+		sendResponseOrError(op, err, w, nil)
 		return
 	}
 
@@ -401,28 +282,12 @@ func (h *TimeTrackingService) HandlerDeleteUser(w http.ResponseWriter, r *http.R
 
 	seriesNumber := strings.Split(data.PasportSeriesNumber, " ")
 	if len(seriesNumber) != 2 || seriesNumber[0] == "" || seriesNumber[1] == "" {
-		slog.Info("TimeTrackingService: HandlerDeleteUser failed", slog.String("error", "invalid pasport number"))
-		http.Error(w, "invalid pasport number", http.StatusBadRequest)
+		sendResponseOrError(op, &InvalidError{"invalid passport"}, w, body)
 		return
 	}
 
 	err = h.DeleteUser(seriesNumber[0], seriesNumber[1])
-	if err != nil {
-		slog.Info("TimeTrackingService: HandlerDeleteUser failed", slog.String("error", err.Error()))
-
-		if errors.As(err, &ErrInternal) {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-
-	slog.Debug("TimeTrackingService: HandlerDeleteUser success")
-
-	w.Write([]byte("OK"))
-	w.WriteHeader(http.StatusOK)
+	sendResponseOrError(op, err, w, nil)
 }
 
 // HandlerUpdateUser - обновить данные пользователя
@@ -446,17 +311,13 @@ func (h *TimeTrackingService) HandlerUpdateUser(w http.ResponseWriter, r *http.R
 	slog.Debug("TimeTrackingService: HandlerUpdateUser", slog.String("body", string(body)))
 
 	if err != nil {
-		slog.Info("TimeTrackingService: HandlerUpdateUser failed", slog.String("error", err.Error()))
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		sendResponseOrError("HandlerUpdateUser", err, w, nil)
 		return
 	}
 
 	var data map[string]any
-
-	err = json.Unmarshal(body, &data)
-	if err != nil {
-		slog.Info("TimeTrackingService: HandlerUpdateUser failed", slog.String("error", err.Error()))
-		http.Error(w, err.Error(), http.StatusBadRequest)
+	if err := json.Unmarshal(body, &data); err != nil {
+		sendResponseOrError("HandlerUpdateUser", err, w, nil)
 		return
 	}
 
@@ -466,8 +327,7 @@ func (h *TimeTrackingService) HandlerUpdateUser(w http.ResponseWriter, r *http.R
 
 	seriesNumber := strings.Split(pasportNumber, " ")
 	if len(seriesNumber) != 2 || seriesNumber[0] == "" || seriesNumber[1] == "" {
-		slog.Info("TimeTrackingService: HandlerUpdateUser failed", slog.String("error", "invalid pasport number"))
-		http.Error(w, "invalid pasport number", http.StatusBadRequest)
+		sendResponseOrError("HandlerUpdateUser", &InvalidError{"invalid passport"}, w, body)
 		return
 	}
 
@@ -475,21 +335,11 @@ func (h *TimeTrackingService) HandlerUpdateUser(w http.ResponseWriter, r *http.R
 
 	err = h.UpdateInfoUser(seriesNumber[0], seriesNumber[1], data)
 	if err != nil {
-		slog.Info("TimeTrackingService: HandlerUpdateUser failed", slog.String("error", err.Error()))
-
-		if errors.As(err, &ErrInternal) {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		sendResponseOrError("HandlerUpdateUser", err, w, nil)
 		return
 	}
 
-	slog.Debug("TimeTrackingService: HandlerUpdateUser success")
-
-	w.Write([]byte("OK"))
-	w.WriteHeader(http.StatusOK)
+	sendResponseOrError("HandlerUpdateUser", err, w, nil)
 }
 
 // HandlerCreateUser - создание пользователя
@@ -511,19 +361,15 @@ func (h *TimeTrackingService) HandlerCreateUser(w http.ResponseWriter, r *http.R
 	slog.Debug("TimeTrackingService: HandlerCreateUser", slog.String("body", string(body)))
 
 	if err != nil {
-		slog.Info("TimeTrackingService: HandlerCreateUser failed", slog.String("error", err.Error()))
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		sendResponseOrError("HandlerCreateUser", err, w, nil)
 		return
 	}
 
 	var data struct {
 		PasportSeriesNumber string `json:"pasportNumber"`
 	}
-
-	err = json.Unmarshal(body, &data)
-	if err != nil {
-		slog.Info("TimeTrackingService: HandlerCreateUser failed", slog.String("error", err.Error()))
-		http.Error(w, err.Error(), http.StatusBadRequest)
+	if err := json.Unmarshal(body, &data); err != nil {
+		sendResponseOrError("HandlerCreateUser", err, w, nil)
 		return
 	}
 
@@ -531,26 +377,10 @@ func (h *TimeTrackingService) HandlerCreateUser(w http.ResponseWriter, r *http.R
 
 	seriesNumber := strings.Split(data.PasportSeriesNumber, " ")
 	if len(seriesNumber) != 2 || seriesNumber[0] == "" || seriesNumber[1] == "" {
-		slog.Info("TimeTrackingService: HandlerCreateUser failed", slog.String("error", "invalid pasport number"))
-		http.Error(w, "invalid pasport number", http.StatusBadRequest)
+		sendResponseOrError("HandlerCreateUser", &InvalidError{"invalid passport"}, w, body)
 		return
 	}
 
 	newId, err := h.CreateUser(seriesNumber[0], seriesNumber[1])
-	if err != nil {
-		slog.Info("TimeTrackingService: HandlerCreateUser failed", slog.String("error", err.Error()))
-
-		if errors.As(err, &ErrInternal) {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-
-	slog.Debug("TimeTrackingService: HandlerCreateUser success")
-
-	w.Write([]byte(fmt.Sprintf(`{"id": %d}`, newId)))
-	w.WriteHeader(http.StatusOK)
+	sendResponseOrError("HandlerCreateUser", err, w, []byte(fmt.Sprintf(`{"id": %d}`, newId)))
 }

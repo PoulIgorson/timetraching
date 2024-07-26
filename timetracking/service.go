@@ -25,6 +25,18 @@ type User struct {
 	Address       string `json:"address"`              // адрес
 }
 
+func NewUser(data map[string]any) *User {
+	return &User{
+		Id:            get[int32](data, "id"),
+		PasportSeries: get[string](data, "pasport_series"),
+		PasportNumber: get[string](data, "pasport_number"),
+		Surname:       get[string](data, "surname"),
+		Name:          get[string](data, "name"),
+		Patronymic:    get[string](data, "patronymic"),
+		Address:       get[string](data, "address"),
+	}
+}
+
 type Task struct {
 	Id          int32     `json:"-"`
 	Title       string    `json:"title"`       // название
@@ -35,6 +47,20 @@ type Task struct {
 	UserId   int32         `json:"userId"`   // идентификатор пользователя
 	Cost     time.Duration `json:"cost"`     // потраченное время
 	WorkFrom time.Time     `json:"WorkFrom"` // время начала работы
+}
+
+func NewTask(data map[string]any) *Task {
+	return &Task{
+		Id:          get[int32](data, "id"),
+		Title:       get[string](data, "title"),
+		Description: get[string](data, "description"),
+		PeriodFrom:  get[time.Time](data, "period_from"),
+		PeriodTo:    get[time.Time](data, "period_to"),
+
+		UserId:   get[int32](data, "user_id"),
+		Cost:     time.Duration(get[int64](data, "cost")),
+		WorkFrom: get[time.Time](data, "work_from"),
+	}
 }
 
 // Сервис
@@ -49,58 +75,74 @@ func NewTimeTrackingService(storage Storage) *TimeTrackingService {
 	}
 }
 
-func get[T any](fields map[string]any, name string) T {
-	if v, ok := fields[name].(T); ok {
-		return v
+func processStorageError(op string, err error, needLog bool) error {
+	if err == nil {
+		return nil
 	}
-	return *new(T)
+	if errors.Is(err, sql.ErrNoRows) {
+		if needLog {
+			slog.Info(op + " not found")
+		}
+		return &NotFoundError{"not found"}
+	}
+
+	if needLog {
+		slog.Info(op + " failed")
+	}
+	return errors.Join(&StorageError{}, err)
 }
 
 // Методы
 
+// Находит пользователя по паспорту
+func (s *TimeTrackingService) FindUserByPassport(pasportSeries, pasportNumber string) (*User, error) {
+	slog.Debug("TimeTrackingService: FindUserByPassport", slog.String("pasportSeries", pasportSeries), slog.String("pasportNumber", pasportNumber))
+
+	if pasportSeries == "" || pasportNumber == "" {
+		return nil, &InvalidError{"pasportSeries or pasportNumber is empty"}
+	}
+
+	filter := map[string]any{
+		"pasport_series": pasportSeries,
+		"pasport_number": pasportNumber,
+	}
+
+	user, err := s.FindUsersByFilter(filter, 1, 0)
+	if err != nil {
+		slog.Info("TimeTrackingService: FindUserByPassport failed", slog.String("error", err.Error()))
+		return nil, err
+	}
+
+	if len(user) == 0 {
+		slog.Info("TimeTrackingService: FindUserByPassport failed", slog.String("error", "user not found"))
+		return nil, &NotFoundError{"user not found"}
+	}
+
+	return user[0], nil
+}
+
 // Находит пользователей по фильтру с пагинацией, возвращает список пользователей
 // Если не находит записей возвращает ErrNoRows
 func (s *TimeTrackingService) FindUsersByFilter(filter map[string]any, limit, offset int) ([]*User, error) {
-	Logger.Debug("TimeTrackingService: FindUsersByFilter", slog.Any("filter", filter), slog.Int("limit", limit), slog.Int("offset", offset))
+	const op = "TimeTrackingService: FindUsersByFilter"
 
-	// Проверка существования хранилища
-	if s.storage == nil {
-		Logger.Info("TimeTrackingService: FindUsersByFilter", slog.String("error", "storage is nil"))
-		return nil, ErrInternal
-	}
+	Logger.Debug(op, slog.Any("filter", filter), slog.Int("limit", limit), slog.Int("offset", offset))
 
 	// Получение пользователей по фильтру с пагинацией
 	reader, err := s.storage.Select(UserCollection, filter, limit, offset)
 	if err != nil {
-		// Перехват отсутствия записей
-		if errors.As(err, sql.ErrNoRows) {
-			Logger.Info("TimeTrackingService: FindUsersByFilter", slog.String("info", "no users found"))
-			return nil, sql.ErrNoRows
-		}
-
-		// Иначе возвращаем ошибку
-		Logger.Info("TimeTrackingService: FindUsersByFilter failed", slog.String("error", err.Error()))
-		return nil, errors.Join(ErrStorage, err)
+		return nil, processStorageError(op, err, true)
 	}
 
 	// Чтение пользователей
 	var users []*User
 	for reader.Next() {
 		record, err := reader.Read()
-		if err != nil && !errors.As(err, sql.ErrNoRows) {
-			Logger.Info("TimeTrackingService: FindUsersByFilter failed", slog.String("error", err.Error()))
-			return nil, errors.Join(ErrStorage, err)
+		if err := processStorageError(op, err, true); err != nil {
+			return nil, err
 		}
-		user := &User{
-			Id:            get[int32](record.Fields, "id"),
-			PasportSeries: get[string](record.Fields, "pasport_series"),
-			PasportNumber: get[string](record.Fields, "pasport_number"),
-			Surname:       get[string](record.Fields, "surname"),
-			Name:          get[string](record.Fields, "name"),
-			Patronymic:    get[string](record.Fields, "patronymic"),
-			Address:       get[string](record.Fields, "address"),
-		}
-		users = append(users, user)
+
+		users = append(users, NewUser(record.Fields))
 	}
 
 	Logger.Debug("TimeTrackingService: FindUsersByFilter users found", slog.Int("count", len(users)))
@@ -110,48 +152,25 @@ func (s *TimeTrackingService) FindUsersByFilter(filter map[string]any, limit, of
 // Находит задач по фильтру с пагинацией, возвращает список задач
 // Если не находит записей возвращает ErrNoRows
 func (s *TimeTrackingService) FindTasksByFilter(filter map[string]any, limit, offset int) ([]*Task, error) {
-	Logger.Debug("TimeTrackingService: FindTasksByFilter", slog.Any("filter", filter), slog.Int("limit", limit), slog.Int("offset", offset))
+	const op = "TimeTrackingService: FindTasksByFilter"
 
-	// Проверка существования хранилища
-	if s.storage == nil {
-		Logger.Info("TimeTrackingService: FindTasksByFilter", slog.String("error", "storage is nil"))
-		return nil, ErrInternal
-	}
+	Logger.Debug(op, slog.Any("filter", filter), slog.Int("limit", limit), slog.Int("offset", offset))
 
 	// Получение задач по фильтру с пагинацией
 	reader, err := s.storage.Select(TaskCollection, filter, limit, offset)
 	if err != nil {
-		// Перехват отсутствия записей
-		if errors.As(err, sql.ErrNoRows) {
-			Logger.Info("TimeTrackingService: FindTasksByFilter", slog.String("info", "no tasks found"))
-			return nil, sql.ErrNoRows
-		}
-
-		// Иначе возвращаем ошибку
-		Logger.Info("TimeTrackingService: FindTasksByFilter failed", slog.String("error", err.Error()))
-		return nil, errors.Join(ErrStorage, err)
+		return nil, processStorageError(op, err, true)
 	}
 
 	// Чтение задач
 	var tasks []*Task
 	for reader.Next() {
 		record, err := reader.Read()
-		if err != nil && !errors.As(err, sql.ErrNoRows) {
-			Logger.Info("TimeTrackingService: FindTasksByFilter failed", slog.String("error", err.Error()))
-			return nil, errors.Join(ErrStorage, err)
+		if err := processStorageError(op, err, true); err != nil {
+			return nil, err
 		}
-		task := &Task{
-			Id:          get[int32](record.Fields, "id"),
-			Title:       get[string](record.Fields, "title"),
-			Description: get[string](record.Fields, "description"),
-			PeriodFrom:  get[time.Time](record.Fields, "period_from"),
-			PeriodTo:    get[time.Time](record.Fields, "period_to"),
 
-			UserId:   get[int32](record.Fields, "user_id"),
-			Cost:     time.Duration(get[int64](record.Fields, "cost")),
-			WorkFrom: get[time.Time](record.Fields, "work_from"),
-		}
-		tasks = append(tasks, task)
+		tasks = append(tasks, NewTask(record.Fields))
 	}
 
 	Logger.Debug("TimeTrackingService: FindTasksByFilter tasks found", slog.Int("count", len(tasks)))
@@ -160,60 +179,41 @@ func (s *TimeTrackingService) FindTasksByFilter(filter map[string]any, limit, of
 
 // Вычисляет стоимость задачи по идентификатору пользователя
 func (s *TimeTrackingService) CalculateCostByUser(pasportSeries, pasportNumber string, begin, end time.Time) ([]string, error) {
-	Logger.Debug("TimeTrackingService: CalculateCostByUser", slog.String("pasportSeries", pasportSeries), slog.String("pasportNumber", pasportNumber))
+	const op = "TimeTrackingService: CalculateCostByUser"
 
-	// Проверка существования хранилища
-	if s.storage == nil {
-		Logger.Info("TimeTrackingService: CalculateCostByUser", slog.String("error", "storage is nil"))
-		return nil, ErrInternal
-	}
+	Logger.Debug(op, slog.String("pasportSeries", pasportSeries), slog.String("pasportNumber", pasportNumber))
 
 	// Поиск пользователя по паспорту
-	filter := map[string]any{
-		"pasport_series": pasportSeries,
-		"pasport_number": pasportNumber,
-	}
-	user, err := s.FindUsersByFilter(filter, 1, 0)
+	user, err := s.FindUserByPassport(pasportSeries, pasportNumber)
 	if err != nil {
-		Logger.Info("TimeTrackingService: CalculateCostByUser failed", slog.String("error", err.Error()))
-		return nil, err
+		return nil, processStorageError(op, err, false)
 	}
 
-	Logger.Debug("TimeTrackingService: CalculateCostByUser user found", slog.Int("user", int(user[0].Id)))
+	Logger.Debug("TimeTrackingService: CalculateCostByUser user found", slog.Int("user", int(user.Id)))
 
 	// Получение задач пользователя
-	filter = map[string]any{
-		"user_id": user[0].Id,
+	filter := map[string]any{
+		"user_id": user.Id,
 	}
 	reader, err := s.storage.Select(TaskCollection, filter, 0, 0)
 	if err != nil {
-		// Перехват отсутствия записей
-		if errors.As(err, sql.ErrNoRows) {
-			Logger.Info("TimeTrackingService: CalculateCostByUser", slog.String("error", "no tasks found"))
-			return []string{}, nil
-		}
-
-		// Иначе возвращаем ошибку
-		Logger.Info("TimeTrackingService: CalculateCostByUser failed", slog.String("error", err.Error()))
-		return nil, errors.Join(ErrStorage, err)
+		return nil, processStorageError(op, err, true)
 	}
 
 	// Подсчет затраченного времени
 	var costs []string
 	for reader.Next() {
 		record, err := reader.Read()
-		if err != nil && !errors.As(err, sql.ErrNoRows) {
-			Logger.Info("TimeTrackingService: CalculateCostByUser failed", slog.String("error", err.Error()))
-			return nil, errors.Join(ErrStorage, err)
+		if err := processStorageError(op, err, true); err != nil {
+			return nil, err
 		}
+
 		periodFrom := get[time.Time](record.Fields, "period_from")
 		periodTo := get[time.Time](record.Fields, "period_to")
 
 		if periodTo.Before(begin) || periodFrom.After(end) {
 			continue
 		}
-
-		fmt.Printf("%t", record.Fields)
 
 		costs = append(costs, fmt.Sprintf("%d-%v", record.Id, time.Duration(get[int64](record.Fields, "cost")).Truncate(time.Second)))
 	}
@@ -224,109 +224,84 @@ func (s *TimeTrackingService) CalculateCostByUser(pasportSeries, pasportNumber s
 		return costI[1] > costJ[1]
 	})
 
-	Logger.Debug("TimeTrackingService: CalculateCostByUser cost calculated", slog.Int("userId", int(user[0].Id)), slog.Any("costs", costs))
+	Logger.Debug("TimeTrackingService: CalculateCostByUser cost calculated", slog.Int("userId", int(user.Id)), slog.Any("costs", costs))
 	return costs, nil
 }
 
 // Запуск задачи для пользователя
 func (s *TimeTrackingService) BeginTaskForUser(pasportSeries, pasportNumber string, taskId int32) error {
-	Logger.Debug("TimeTrackingService: BeginTaskForUser", slog.String("pasportSeries", pasportSeries), slog.String("pasportNumber", pasportNumber), slog.Int("taskId", int(taskId)))
+	const op = "TimeTrackingService: BeginTaskForUser"
 
-	// Проверка существования хранилища
-	if s.storage == nil {
-		Logger.Info("TimeTrackingService: BeginTaskForUser", slog.String("error", "storage is nil"))
-		return ErrInternal
-	}
+	Logger.Debug(op, slog.String("pasportSeries", pasportSeries), slog.String("pasportNumber", pasportNumber), slog.Int("taskId", int(taskId)))
 
 	// Поиск пользователя по паспорту
-	filter := map[string]any{
-		"pasport_series": pasportSeries,
-		"pasport_number": pasportNumber,
-	}
-	user, err := s.FindUsersByFilter(filter, 1, 0)
+	user, err := s.FindUserByPassport(pasportSeries, pasportNumber)
 	if err != nil {
-		Logger.Info("TimeTrackingService: BeginTaskForUser failed", slog.String("error", err.Error()))
-		return err
+		return processStorageError(op, err, false)
 	}
 
-	Logger.Debug("TimeTrackingService: BeginTaskForUser user found", slog.Int("user", int(user[0].Id)))
+	Logger.Debug(op+": user found", slog.Int("user", int(user.Id)))
 
 	// Поиск задачи по идентификатору
-	filter = map[string]any{
+	filter := map[string]any{
 		"id": taskId,
 	}
 	task, err := s.FindTasksByFilter(filter, 1, 0)
 	if err != nil {
-		Logger.Info("TimeTrackingService: BeginTaskForUser failed", slog.String("error", err.Error()))
-		return err
+		return processStorageError(op, err, false)
 	}
 
-	Logger.Debug("TimeTrackingService: BeginTaskForUser task found", slog.Int("task", int(task[0].Id)))
+	Logger.Debug(op+": task found", slog.Int("task", int(task[0].Id)))
 
 	if task[0].WorkFrom != (time.Time{}) {
-		Logger.Info("TimeTrackingService: BeginTaskForUser failed", slog.String("error", "task already started"))
-		return fmt.Errorf("task already started")
+		return processStorageError(op, errors.New("task already started"), true)
 	}
 
 	// Начало задачи
 	updateData := map[string]any{
 		"work_from": time.Now().UTC(),
-		"user_id":   user[0].Id,
+		"user_id":   user.Id,
 	}
 	err = s.storage.Update(TaskCollection, filter, updateData)
 	if err != nil {
-		Logger.Info("TimeTrackingService: BeginTaskForUser failed", slog.String("error", err.Error()))
-		return errors.Join(ErrStorage, err)
+		return processStorageError(op, err, true)
 	}
 
-	Logger.Debug("TimeTrackingService: BeginTaskForUser task started", slog.Int("userId", int(user[0].Id)), slog.Int("task", int(task[0].Id)))
-
+	Logger.Debug(op+": task started", slog.Int("userId", int(user.Id)), slog.Int("task", int(task[0].Id)))
 	return nil
 }
 
 // Завершение задачи для пользователя
 func (s *TimeTrackingService) EndTaskForUser(pasportSeries, pasportNumber string, taskId int32) error {
-	Logger.Debug("TimeTrackingService: EndTaskForUser", slog.String("pasportSeries", pasportSeries), slog.String("pasportNumber", pasportNumber), slog.Int("taskId", int(taskId)))
+	const op = "TimeTrackingService: EndTaskForUser"
 
-	// Проверка существования хранилища
-	if s.storage == nil {
-		Logger.Info("TimeTrackingService: EndTaskForUser", slog.String("error", "storage is nil"))
-		return ErrInternal
-	}
+	Logger.Debug(op, slog.String("pasportSeries", pasportSeries), slog.String("pasportNumber", pasportNumber), slog.Int("taskId", int(taskId)))
 
 	// Поиск пользователя по паспорту
-	filter := map[string]any{
-		"pasport_series": pasportSeries,
-		"pasport_number": pasportNumber,
-	}
-	user, err := s.FindUsersByFilter(filter, 1, 0)
+	user, err := s.FindUserByPassport(pasportSeries, pasportNumber)
 	if err != nil {
-		Logger.Info("TimeTrackingService: EndTaskForUser failed", slog.String("error", err.Error()))
-		return err
+		return processStorageError(op, err, false)
 	}
 
-	Logger.Debug("TimeTrackingService: EndTaskForUser user found", slog.Int("user", int(user[0].Id)))
+	Logger.Debug("TimeTrackingService: EndTaskForUser user found", slog.Int("user", int(user.Id)))
 
 	// Поиск задачи по идентификатору
-	filter = map[string]any{
+	filter := map[string]any{
 		"id": taskId,
 	}
 	task, err := s.FindTasksByFilter(filter, 1, 0)
 	if err != nil {
-		Logger.Info("TimeTrackingService: EndTaskForUser failed", slog.String("error", err.Error()))
-		return err
+		return processStorageError(op, err, false)
 	}
 
 	if len(task) == 0 {
-		Logger.Info("TimeTrackingService: EndTaskForUser failed", slog.String("error", "task not found"))
-		return fmt.Errorf("task not found")
+		return processStorageError(op, &NotFoundError{"task not found"}, true)
 	}
 
 	Logger.Debug("TimeTrackingService: EndTaskForUser task found", slog.Int("task", int(task[0].Id)))
 
 	if task[0].WorkFrom == (time.Time{}) {
-		Logger.Info("TimeTrackingService: EndTaskForUser failed", slog.String("error", "task not started"))
-		return fmt.Errorf("task not started")
+		return processStorageError(op, errors.New("task not started"), true)
 	}
 
 	// Конец задачи
@@ -336,112 +311,80 @@ func (s *TimeTrackingService) EndTaskForUser(pasportSeries, pasportNumber string
 	}
 	err = s.storage.Update(TaskCollection, filter, updateData)
 	if err != nil {
-		Logger.Info("TimeTrackingService: EndTaskForUser failed", slog.String("error", err.Error()))
-		return errors.Join(ErrStorage, err)
+		return processStorageError(op, err, true)
 	}
 
-	Logger.Debug("TimeTrackingService: EndTaskForUser task ended", slog.Int("userId", int(user[0].Id)), slog.Int("task", int(task[0].Id)))
-
+	Logger.Debug("TimeTrackingService: EndTaskForUser task ended", slog.Int("userId", int(user.Id)), slog.Int("task", int(task[0].Id)))
 	return nil
 }
 
 // Удаление пользователя
 func (s *TimeTrackingService) DeleteUser(pasportSeries, pasportNumber string) error {
-	Logger.Debug("TimeTrackingService: DeleteUser", slog.String("pasportSeries", pasportSeries), slog.String("pasportNumber", pasportNumber))
+	const op = "TimeTrackingService: DeleteUser"
 
-	// Проверка существования хранилища
-	if s.storage == nil {
-		Logger.Info("TimeTrackingService: DeleteUser", slog.String("error", "storage is nil"))
-		return ErrInternal
-	}
+	Logger.Debug(op, slog.String("pasportSeries", pasportSeries), slog.String("pasportNumber", pasportNumber))
 
 	// Поиск пользователя по паспорту
-	filter := map[string]any{
-		"pasport_series": pasportSeries,
-		"pasport_number": pasportNumber,
-	}
-	user, err := s.FindUsersByFilter(filter, 1, 0)
+	user, err := s.FindUserByPassport(pasportSeries, pasportNumber)
 	if err != nil {
-		Logger.Info("TimeTrackingService: DeleteUser failed", slog.String("error", err.Error()))
-		return err
+		return processStorageError(op, err, false)
 	}
 
-	Logger.Debug("TimeTrackingService: DeleteUser user found", slog.Int("user", int(user[0].Id)))
+	Logger.Debug("TimeTrackingService: DeleteUser user found", slog.Int("user", int(user.Id)))
 
 	// Удаление пользователя
-	err = s.storage.Delete(UserCollection, user[0].Id)
+	err = s.storage.Delete(UserCollection, user.Id)
 	if err != nil {
-		Logger.Info("TimeTrackingService: DeleteUser failed", slog.String("error", err.Error()))
-		return errors.Join(ErrStorage, err)
+		return processStorageError(op, err, true)
 	}
 
-	Logger.Debug("TimeTrackingService: DeleteUser user deleted", slog.Int("userId", int(user[0].Id)))
-
+	Logger.Debug("TimeTrackingService: DeleteUser user deleted", slog.Int("userId", int(user.Id)))
 	return nil
 }
 
 // Обновление информации о пользователе
 func (s *TimeTrackingService) UpdateInfoUser(pasportSeries, pasportNumber string, info map[string]any) error {
-	Logger.Debug("TimeTrackingService: UpdateInfoUser", slog.String("pasportSeries", pasportSeries), slog.String("pasportNumber", pasportNumber), slog.Any("info", info))
+	const op = "TimeTrackingService: UpdateInfoUser"
 
-	// Проверка существования хранилища
-	if s.storage == nil {
-		Logger.Info("TimeTrackingService: UpdateInfoUser", slog.String("error", "storage is nil"))
-		return ErrInternal
-	}
+	Logger.Debug(op, slog.String("pasportSeries", pasportSeries), slog.String("pasportNumber", pasportNumber), slog.Any("info", info))
 
 	// Поиск пользователя по паспорту
-	filter := map[string]any{
-		"pasport_series": pasportSeries,
-		"pasport_number": pasportNumber,
-	}
-	user, err := s.FindUsersByFilter(filter, 1, 0)
+	user, err := s.FindUserByPassport(pasportSeries, pasportNumber)
 	if err != nil {
-		Logger.Info("TimeTrackingService: UpdateInfoUser failed", slog.String("error", err.Error()))
-		return err
+		return processStorageError(op, err, false)
 	}
 
-	Logger.Debug("TimeTrackingService: UpdateInfoUser user found", slog.Int("user", int(user[0].Id)))
+	Logger.Debug("TimeTrackingService: UpdateInfoUser user found", slog.Int("user", int(user.Id)))
 
 	// Обновление информации о пользователе
+	filter := map[string]any{
+		"id": user.Id,
+	}
 	err = s.storage.Update(UserCollection, filter, info)
 	if err != nil {
-		Logger.Info("TimeTrackingService: UpdateInfoUser failed", slog.String("error", err.Error()))
-		return errors.Join(ErrStorage, err)
+		return processStorageError(op, err, true)
 	}
 
-	Logger.Debug("TimeTrackingService: UpdateInfoUser user updated", slog.Int("userId", int(user[0].Id)))
+	Logger.Debug("TimeTrackingService: UpdateInfoUser user updated", slog.Int("userId", int(user.Id)))
 
 	return nil
 }
 
 // Создание пользователя
 func (s *TimeTrackingService) CreateUser(pasportSeries, pasportNumber string) (int32, error) {
-	Logger.Debug("TimeTrackingService: CreateUser", slog.String("pasportSeries", pasportSeries), slog.String("pasportNumber", pasportNumber))
-
-	// Проверка существования хранилища
-	if s.storage == nil {
-		Logger.Info("TimeTrackingService: CreateUser", slog.String("error", "storage is nil"))
-		return 0, ErrInternal
-	}
+	const op = "TimeTrackingService: CreateUser"
+	Logger.Debug(op, slog.String("pasportSeries", pasportSeries), slog.String("pasportNumber", pasportNumber))
 
 	// Поиск пользователя по паспорту
-	filter := map[string]any{
-		"pasport_series": pasportSeries,
-		"pasport_number": pasportNumber,
-	}
-	user, err := s.FindUsersByFilter(filter, 1, 0)
-	if err != nil {
-		if !errors.As(err, sql.ErrNoRows) {
-			Logger.Info("TimeTrackingService: CreateUser failed", slog.String("error", err.Error()))
-			return 0, sql.ErrNoRows
-		}
+	user, err := s.FindUserByPassport(pasportSeries, pasportNumber)
+	if err != nil && !errors.Is(err, &NotFoundError{}) {
+		return 0, processStorageError(op, err, false)
 	}
 
 	// Пользователь уже существует, возвращаем его идентификатор
-	if len(user) > 0 {
-		Logger.Debug("TimeTrackingService: CreateUser user found", slog.Int("user", int(user[0].Id)))
-		return user[0].Id, nil
+	if user != nil {
+		Logger.Debug("TimeTrackingService: CreateUser user found", slog.Int("user", int(user.Id)))
+		return user.Id, nil
 	}
 
 	// Создание пользователя
@@ -452,11 +395,9 @@ func (s *TimeTrackingService) CreateUser(pasportSeries, pasportNumber string) (i
 
 	newId, err := s.storage.Insert(UserCollection, userData)
 	if err != nil {
-		Logger.Info("TimeTrackingService: CreateUser failed", slog.String("error", err.Error()))
-		return 0, errors.Join(ErrStorage, err)
+		return 0, processStorageError(op, err, true)
 	}
 
 	Logger.Debug("TimeTrackingService: CreateUser user created", slog.Int("userId", int(newId)))
-
 	return newId, nil
 }
