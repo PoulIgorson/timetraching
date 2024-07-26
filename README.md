@@ -15,7 +15,7 @@ password = password
 database = namedatabase[?sslmode=disable]
 ```
 3. `go build [-o filename] .`
-4. Запустить `filename`.
+4. Запустить `timetracking` или `filename`, при указании его при сборке.
 
 * При запуске проекта создатся таблицы `users` и `tasks`.
 * В таблице `tasks` будет несколько задач для тестов.
