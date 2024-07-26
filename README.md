@@ -14,7 +14,7 @@ username = username
 password = password
 database = namedatabase[?sslmode=disable]
 ```
-3. go build [-o filename] .
+3. `go build [-o filename] .`
 4. Запустить `filename`.
 
 * При запуске проекта создатся таблицы `users` и `tasks`.
